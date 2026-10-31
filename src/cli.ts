@@ -367,12 +367,13 @@ program
   .option('-p, --port <name>', 'MIDI port name')
   .option('--start <addr>', 'start address (decimal or 0x hex)', '0')
   .option('--length <n>', 'bytes to read (default: whole 64 KB)', String(SLOT_CAPACITY_BYTES))
-  .option('--idle <ms>', 'stop when no frame arrives for this long', String(3000))
-  .option('--max <ms>', 'overall timeout', String(120000))
+  .option('--chunk <n>', 'bytes per request, 1..16', String(16))
+  .option('--timeout <ms>', 'per-request reply timeout', String(2000))
+  .option('-v, --verbose', 'log progress', false)
   .action(
     async (
       outFile: string,
-      opts: { half: string; port?: string; start: string; length: string; idle: string; max: string }
+      opts: { half: string; port?: string; start: string; length: string; chunk: string; timeout: string; verbose: boolean }
     ) => {
       const half = opts.half.toLowerCase();
       if (half !== 'upper' && half !== 'lower') {
@@ -384,46 +385,51 @@ program
         program.error('start/length must stay inside the 64 KB half', { exitCode: EXIT.ARG_ERROR });
       }
       try {
+        const chunk = Number(opts.chunk);
+        if (!Number.isInteger(chunk) || chunk < 1 || chunk > 16) {
+          program.error('--chunk must be 1..16 (the Mirage answers nothing above 16 bytes)', { exitCode: EXIT.ARG_ERROR });
+        }
         const link = await MirageLink.open({ outPort: opts.port });
-        let frames: Uint8Array[];
-        try {
-          // End address follows the exclusive convention verified for uploads.
-          const collect = link.collectSysex({
-            predicate: isWavesampleAbsoluteData,
-            idleMs: Number(opts.idle),
-            maxMs: Number(opts.max),
-          });
-          link.sendSysex(
-            buildWavesampleAbsoluteRequest({
-              half: half as 'upper' | 'lower',
-              startAddress: start,
-              endAddress: (start + length) & 0xffff,
-            })
-          );
-          frames = await collect;
-        } finally {
-          link.close();
-        }
-        if (frames.length === 0) {
-          console.error('error: no wavesample data frames received');
-          process.exit(EXIT.TRANSFER_FAIL);
-        }
         const image = new Uint8Array(length);
         let covered = 0;
         let badChecksums = 0;
-        for (const f of frames) {
-          const d = parseWavesampleAbsoluteData(f);
-          if (!d.checksumOk) badChecksums++;
-          const offset = d.startAddress - start;
-          const n = Math.min(d.audio8.length, length - offset);
-          if (offset < 0 || n <= 0) continue;
-          image.set(d.audio8.subarray(0, n), offset);
-          covered += n;
+        let retries = 0;
+        try {
+          // The Mirage answers one 0x0C frame per request and only for ranges
+          // of at most 16 bytes (verified on hardware), so read in small chunks.
+          for (let offset = 0; offset < length; offset += chunk) {
+            const n = Math.min(chunk, length - offset);
+            const request = buildWavesampleAbsoluteRequest({
+              half: half as 'upper' | 'lower',
+              startAddress: start + offset,
+              endAddress: (start + offset + n) & 0xffff,
+            });
+            let d: ReturnType<typeof parseWavesampleAbsoluteData> | undefined;
+            for (let attempt = 0; attempt < 3 && !d; attempt++) {
+              const reply = link.awaitSysex({ predicate: isWavesampleAbsoluteData, timeoutMs: Number(opts.timeout) });
+              link.sendSysex(request);
+              try {
+                d = parseWavesampleAbsoluteData(await reply);
+              } catch {
+                retries++;
+              }
+            }
+            if (!d) {
+              console.error(`error: no reply for ${start + offset}..${start + offset + n} after 3 attempts`);
+              process.exit(EXIT.TRANSFER_FAIL);
+            }
+            if (!d.checksumOk) badChecksums++;
+            const got = Math.min(d.audio8.length, n);
+            image.set(d.audio8.subarray(0, got), offset);
+            covered += got;
+            if (opts.verbose && (offset / chunk) % 256 === 0) console.error(`[mirage-send] ${covered}/${length} bytes`);
+          }
+        } finally {
+          link.close();
         }
         await writeFile(outFile, image);
         console.log(
-          `Received ${frames.length} frame(s), ${covered}/${length} bytes, ` +
-            `${badChecksums} checksum error(s). Wrote ${outFile}.`
+          `Read ${covered}/${length} bytes, ${badChecksums} checksum error(s), ${retries} retried request(s). Wrote ${outFile}.`
         );
         process.exit(badChecksums === 0 && covered >= length ? EXIT.OK : EXIT.TRANSFER_FAIL);
       } catch (err) {
