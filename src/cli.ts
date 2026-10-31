@@ -14,6 +14,7 @@ import {
 import {
   listInputPorts,
   listOutputPorts,
+  MirageLink,
   sendSysexFrames,
   sendSysexFramesGated,
   sleep,
@@ -22,11 +23,14 @@ import { probeMirage } from './probe.js';
 import {
   buildKeypress,
   buildWaveformDump,
+  buildWavesampleAbsoluteRequest,
   buildWavesampleDump,
   buildWavesampleParam,
   concatFrames,
+  isWavesampleAbsoluteData,
   isWavesampleAck,
   isWavesampleNak,
+  parseWavesampleAbsoluteData,
 } from './sysex.js';
 import { KEY, parseKey } from './keys.js';
 
@@ -301,6 +305,137 @@ program
         process.exit(
           /port/i.test(msg) ? EXIT.PORT_NOT_FOUND : EXIT.TRANSFER_FAIL
         );
+      }
+    }
+  );
+
+// ---------------------------------------------------------------------------
+// `note` — one MIDI note on/off, for automated audio measurements
+// ---------------------------------------------------------------------------
+
+program
+  .command('note')
+  .description('Play one MIDI note: note on, hold, note off.')
+  .argument('<note>', 'MIDI note number 0..127')
+  .option('-p, --port <name>', 'MIDI output port name')
+  .option('--velocity <n>', 'note-on velocity 1..127', String(100))
+  .option('--hold <ms>', 'milliseconds between note on and note off', String(500))
+  .option('--channel <n>', 'MIDI channel 1..16', String(1))
+  .action(
+    async (
+      noteArg: string,
+      opts: { port?: string; velocity: string; hold: string; channel: string }
+    ) => {
+      const note = Number(noteArg);
+      const velocity = Number(opts.velocity);
+      const channel = Number(opts.channel) - 1;
+      if (![note, velocity, channel].every(Number.isInteger) || note > 127 || velocity > 127 || channel > 15 || channel < 0) {
+        program.error('note, velocity and channel must be integers in range', { exitCode: EXIT.ARG_ERROR });
+      }
+      try {
+        const link = await MirageLink.open({ outPort: opts.port });
+        try {
+          link.send([0x90 | channel, note, velocity]);
+          console.log(`on ${Date.now()}`);
+          await sleep(Number(opts.hold));
+          link.send([0x80 | channel, note, 0]);
+          console.log(`off ${Date.now()}`);
+          await sleep(50);
+        } finally {
+          link.close();
+        }
+        process.exit(EXIT.OK);
+      } catch (err) {
+        printErr(err);
+        process.exit(EXIT.PORT_NOT_FOUND);
+      }
+    }
+  );
+
+// ---------------------------------------------------------------------------
+// `dump` — read wavesample RAM back (cmd 0x0B request, 0x0C replies)
+// ---------------------------------------------------------------------------
+
+program
+  .command('dump')
+  .description(
+    'Read a range of a half\'s 64 KB wavesample RAM back from the Mirage ' +
+      '(MASOS cmd 0x0B) and write it as raw 8-bit unsigned bytes.'
+  )
+  .argument('<out-file>', 'destination .raw file')
+  .requiredOption('--half <upper|lower>', 'which half to read')
+  .option('-p, --port <name>', 'MIDI port name')
+  .option('--start <addr>', 'start address (decimal or 0x hex)', '0')
+  .option('--length <n>', 'bytes to read (default: whole 64 KB)', String(SLOT_CAPACITY_BYTES))
+  .option('--chunk <n>', 'bytes per request, 1..16', String(16))
+  .option('--timeout <ms>', 'per-request reply timeout', String(2000))
+  .option('-v, --verbose', 'log progress', false)
+  .action(
+    async (
+      outFile: string,
+      opts: { half: string; port?: string; start: string; length: string; chunk: string; timeout: string; verbose: boolean }
+    ) => {
+      const half = opts.half.toLowerCase();
+      if (half !== 'upper' && half !== 'lower') {
+        program.error(`Invalid --half "${opts.half}"`, { exitCode: EXIT.ARG_ERROR });
+      }
+      const start = Number(opts.start);
+      const length = Number(opts.length);
+      if (!Number.isInteger(start) || !Number.isInteger(length) || length < 1 || start + length > SLOT_CAPACITY_BYTES) {
+        program.error('start/length must stay inside the 64 KB half', { exitCode: EXIT.ARG_ERROR });
+      }
+      try {
+        const chunk = Number(opts.chunk);
+        if (!Number.isInteger(chunk) || chunk < 1 || chunk > 16) {
+          program.error('--chunk must be 1..16 (the Mirage answers nothing above 16 bytes)', { exitCode: EXIT.ARG_ERROR });
+        }
+        const link = await MirageLink.open({ outPort: opts.port });
+        const image = new Uint8Array(length);
+        let covered = 0;
+        let badChecksums = 0;
+        let retries = 0;
+        try {
+          // The Mirage answers one 0x0C frame per request and only for ranges
+          // of at most 16 bytes (verified on hardware), so read in small chunks.
+          for (let offset = 0; offset < length; offset += chunk) {
+            const n = Math.min(chunk, length - offset);
+            const request = buildWavesampleAbsoluteRequest({
+              half: half as 'upper' | 'lower',
+              startAddress: start + offset,
+              endAddress: (start + offset + n) & 0xffff,
+            });
+            let d: ReturnType<typeof parseWavesampleAbsoluteData> | undefined;
+            for (let attempt = 0; attempt < 3 && !d; attempt++) {
+              const reply = link.awaitSysex({ predicate: isWavesampleAbsoluteData, timeoutMs: Number(opts.timeout) });
+              link.sendSysex(request);
+              try {
+                d = parseWavesampleAbsoluteData(await reply);
+              } catch {
+                retries++;
+              }
+            }
+            if (!d) {
+              console.error(`error: no reply for ${start + offset}..${start + offset + n} after 3 attempts`);
+              process.exit(EXIT.TRANSFER_FAIL);
+            }
+            if (!d.checksumOk) badChecksums++;
+            const got = Math.min(d.audio8.length, n);
+            image.set(d.audio8.subarray(0, got), offset);
+            covered += got;
+            if (opts.verbose && (offset / chunk) % 256 === 0) console.error(`[mirage-send] ${covered}/${length} bytes`);
+          }
+        } finally {
+          link.close();
+        }
+        await writeFile(outFile, image);
+        console.log(
+          `Read ${covered}/${length} bytes, ${badChecksums} checksum error(s), ${retries} retried request(s). Wrote ${outFile}.`
+        );
+        process.exit(badChecksums === 0 && covered >= length ? EXIT.OK : EXIT.TRANSFER_FAIL);
+      } catch (err) {
+        printErr(err);
+        const msg = err instanceof Error ? err.message : String(err);
+        process.exit(/port/i.test(msg) ? EXIT.PORT_NOT_FOUND : EXIT.TRANSFER_FAIL);
       }
     }
   );

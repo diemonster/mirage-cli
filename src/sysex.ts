@@ -468,3 +468,89 @@ export function buildProgramParam(opts: ProgramParamOpts): Uint8Array {
     SYSEX_END,
   ]);
 }
+
+// ---------------------------------------------------------------------------
+// Wavesample Dump Absolute Request (cmd 0x0B) and parsing of the 0x0C reply —
+// ASG §3.1.5 / §3.1.6. The Mirage answers a request with one or more cmd 0x0C
+// messages covering the requested range.
+// ---------------------------------------------------------------------------
+
+export interface WavesampleAbsoluteRequestOpts {
+  half: Half;
+  /** Inclusive start address in the half's 64 KB RAM. */
+  startAddress: number;
+  /** End address as sent on the wire; see `buildWavesampleAbsolute` for the exclusive convention. */
+  endAddress: number;
+}
+
+/** Build a cmd 0x0B request for `startAddress..endAddress` of one half. */
+export function buildWavesampleAbsoluteRequest(
+  opts: WavesampleAbsoluteRequestOpts
+): Uint8Array {
+  for (const [name, v] of [
+    ['startAddress', opts.startAddress],
+    ['endAddress', opts.endAddress],
+  ] as const) {
+    if (!Number.isInteger(v) || v < 0 || v > 0xffff) {
+      throw new Error(`${name} ${v} out of range 0..0xFFFF`);
+    }
+  }
+  const [sLoLs, sLoMs, sHiLs, sHiMs] = addressNybbles(opts.startAddress);
+  const [eLoLs, eLoMs, eHiLs, eHiMs] = addressNybbles(opts.endAddress);
+  const nBit = opts.half === 'upper' ? ABS_N_BIT_UPPER : 0;
+  return frame(CMD.WAVESAMPLE_ABS_REQUEST, [
+    nBit | sLoLs,
+    sLoMs,
+    sHiLs,
+    sHiMs,
+    eLoLs,
+    eLoMs,
+    eHiLs,
+    eHiMs,
+  ]);
+}
+
+export interface WavesampleAbsoluteData {
+  half: Half;
+  startAddress: number;
+  endAddress: number;
+  audio8: Uint8Array;
+  checksumOk: boolean;
+}
+
+/** Is this message a cmd 0x0C wavesample-absolute data frame? */
+export function isWavesampleAbsoluteData(bytes: Uint8Array): boolean {
+  return (
+    bytes.length >= 14 &&
+    bytes[0] === SYSEX_START &&
+    bytes[1] === ENSONIQ_ID &&
+    bytes[2] === MIRAGE_ID &&
+    bytes[3] === CMD.WAVESAMPLE_ABS_DATA &&
+    bytes[bytes.length - 1] === SYSEX_END
+  );
+}
+
+/** Decode a cmd 0x0C frame (the Mirage's reply to 0x0B, or our own upload frame). */
+export function parseWavesampleAbsoluteData(
+  bytes: Uint8Array
+): WavesampleAbsoluteData {
+  if (!isWavesampleAbsoluteData(bytes)) {
+    throw new Error('not a wavesample-absolute data frame');
+  }
+  const a = Array.from(bytes.slice(4, 12), (b) => b & 0x0f);
+  const half: Half = (bytes[4]! & ABS_N_BIT_UPPER) !== 0 ? 'upper' : 'lower';
+  const startAddress = a[0]! | (a[1]! << 4) | (a[2]! << 8) | (a[3]! << 12);
+  const endAddress = a[4]! | (a[5]! << 4) | (a[6]! << 8) | (a[7]! << 12);
+  const nybbles = bytes.slice(12, bytes.length - 2);
+  const checksum = bytes[bytes.length - 2]! & 0x7f;
+  const audio8 = decodeNybbles(nybbles);
+  let sum = a.reduce((s, n) => s + n, 0);
+  for (const n of nybbles) sum += n & 0x0f;
+  return {
+    half,
+    startAddress,
+    endAddress,
+    audio8,
+    checksumOk: (sum & 0x7f) === checksum,
+  };
+}
