@@ -419,3 +419,40 @@ describe('buildWavesampleParam', () => {
     ).toThrow();
   });
 });
+
+import {
+  buildWavesampleAbsolute as buildAbs,
+  buildWavesampleAbsoluteRequest,
+  isWavesampleAbsoluteData,
+  parseWavesampleAbsoluteData,
+} from '../src/sysex.js';
+
+describe('wavesample absolute request (cmd 0x0B)', () => {
+  it('frames start/end address nybbles with the N bit in the first byte', () => {
+    const f = buildWavesampleAbsoluteRequest({ half: 'upper', startAddress: 0x1234, endAddress: 0xabcd });
+    expect(Array.from(f)).toEqual([0xf0, 0x0f, 0x01, 0x0b, 0x10 | 0x4, 0x3, 0x2, 0x1, 0xd, 0xc, 0xb, 0xa, 0xf7]);
+  });
+  it('rejects addresses outside 16 bits', () => {
+    expect(() => buildWavesampleAbsoluteRequest({ half: 'lower', startAddress: -1, endAddress: 0 })).toThrow();
+  });
+});
+
+describe('wavesample absolute data parse (cmd 0x0C)', () => {
+  it('round-trips an upload frame', () => {
+    const audio8 = new Uint8Array([0x01, 0x80, 0xff, 0x7f]);
+    const f = buildAbs({ half: 'lower', startAddress: 0x0100, audio8 });
+    expect(isWavesampleAbsoluteData(f)).toBe(true);
+    const d = parseWavesampleAbsoluteData(f);
+    expect(d.half).toBe('lower');
+    expect(d.startAddress).toBe(0x0100);
+    expect(d.endAddress).toBe(0x0104);
+    expect(Array.from(d.audio8)).toEqual(Array.from(audio8));
+    expect(d.checksumOk).toBe(true);
+  });
+  it('flags a corrupted checksum', () => {
+    const f = buildAbs({ half: 'upper', startAddress: 0, audio8: new Uint8Array([5, 6, 7]) });
+    f[f.length - 2] = (f[f.length - 2]! + 1) & 0x7f;
+    expect(parseWavesampleAbsoluteData(f).checksumOk).toBe(false);
+    expect(parseWavesampleAbsoluteData(f).half).toBe('upper');
+  });
+});

@@ -165,6 +165,41 @@ export class MirageLink {
     });
   }
 
+  /** Send any MIDI message (note on/off, controllers) on the output port. */
+  send(bytes: ArrayLike<number>): void {
+    this.out.send(Array.from(bytes));
+  }
+
+  /**
+   * Collect every SysEx frame matching `predicate` until `idleMs` pass with
+   * no further match, or `maxMs` overall. Resolves with the frames in order.
+   */
+  collectSysex(opts: {
+    predicate: (bytes: Uint8Array) => boolean;
+    idleMs: number;
+    maxMs: number;
+  }): Promise<Uint8Array[]> {
+    return new Promise((resolve) => {
+      const frames: Uint8Array[] = [];
+      let idle: ReturnType<typeof setTimeout> | undefined;
+      const finish = () => {
+        if (idle) clearTimeout(idle);
+        clearTimeout(hard);
+        this.listeners.delete(listener);
+        resolve(frames);
+      };
+      const hard = setTimeout(finish, opts.maxMs);
+      const listener = (bytes: Uint8Array) => {
+        if (!opts.predicate(bytes)) return;
+        frames.push(bytes);
+        if (idle) clearTimeout(idle);
+        idle = setTimeout(finish, opts.idleMs);
+      };
+      this.listeners.add(listener);
+      idle = setTimeout(finish, opts.idleMs);
+    });
+  }
+
   close(): void {
     try {
       this.out.close();
