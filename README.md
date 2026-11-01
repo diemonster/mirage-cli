@@ -184,11 +184,25 @@ pulls a disk slot back into RAM (and overwrites whatever was there).
 ## Protocol notes
 
 The empirically verified facts (the manual is sometimes misleading) are
-stored at `/memories/repo/mirage-protocol.md`. Two important gotchas:
+stored at `/memories/repo/mirage-protocol.md`. Three important gotchas:
 
 - **End address is EXCLUSIVE for cmd 0x0C.** The ASG manual reads as if
   end is inclusive; the hardware NAKs unless we send `start + length`.
   Verified by a 6-variant hardware sweep — see `src/diag-dump.ts`.
+- **RAM readback is validated per request.** `dump` sends one cmd 0x0B
+  request per chunk of at most 16 bytes (the Mirage answers nothing above
+  16) and accepts only a cmd 0x0C frame whose half, start and exclusive end
+  address name that request, with an intact checksum and exactly the
+  requested number of bytes. Frames for other requests, including late
+  duplicates of an earlier chunk, are ignored without costing an attempt;
+  a corrupted, truncated or missing reply is requested again, three
+  requests in all; after that the transfer fails with the failing address
+  and writes no file, so a partial capture cannot pass for a complete one.
+  Whether the reply echoes the end address as exclusive or inclusive is
+  not recorded from hardware, so both are accepted and the byte count is
+  the integrity check. The logic
+  lives in `src/readback.ts` and is tested against a simulated link in
+  `test/readback.test.ts`.
 - **0x00 is a playback-stop marker** in wavesample data. `ffmpeg`'s
   `pcm_u8` produces 0x00 freely for fully-negative samples. `audio.ts`
   clamps 0x00 → 0x01 before transmission and reports the count in
@@ -215,6 +229,7 @@ wavesample-dump (cmd 0x06), and wavesample-parameter (cmd 0x0E).
 | `src/probe.ts`     | parameter-value round-trip probe               |
 | `src/keys.ts`      | front-panel key byte codes + parser            |
 | `src/constants.ts` | IDs, command bytes, slot encoding, defaults    |
+| `src/readback.ts`  | validated RAM readback transaction (cmd 0x0B/0x0C) |
 | `src/diag-dump.ts` | hardware diagnostic (6 cmd-0x0C variants)      |
 | `test/`            | vitest unit tests                              |
 | `bin/mirage-send`  | shebang shim that runs `dist/cli.js`           |

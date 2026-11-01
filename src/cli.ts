@@ -21,16 +21,21 @@ import {
 } from './midi.js';
 import { probeMirage } from './probe.js';
 import {
+  MAX_REQUEST_BYTES,
+  ReadbackError,
+  readWavesampleRam,
+  validateReadbackRange,
+  type ReadbackResult,
+  type ReadbackStats,
+} from './readback.js';
+import {
   buildKeypress,
   buildWaveformDump,
-  buildWavesampleAbsoluteRequest,
   buildWavesampleDump,
   buildWavesampleParam,
   concatFrames,
-  isWavesampleAbsoluteData,
   isWavesampleAck,
   isWavesampleNak,
-  parseWavesampleAbsoluteData,
 } from './sysex.js';
 import { KEY, parseKey } from './keys.js';
 
@@ -367,7 +372,7 @@ program
   .option('-p, --port <name>', 'MIDI port name')
   .option('--start <addr>', 'start address (decimal or 0x hex)', '0')
   .option('--length <n>', 'bytes to read (default: whole 64 KB)', String(SLOT_CAPACITY_BYTES))
-  .option('--chunk <n>', 'bytes per request, 1..16', String(16))
+  .option('--chunk <n>', `bytes per request, 1..${MAX_REQUEST_BYTES}`, String(MAX_REQUEST_BYTES))
   .option('--timeout <ms>', 'per-request reply timeout', String(2000))
   .option('-v, --verbose', 'log progress', false)
   .action(
@@ -381,64 +386,56 @@ program
       }
       const start = Number(opts.start);
       const length = Number(opts.length);
-      if (!Number.isInteger(start) || !Number.isInteger(length) || length < 1 || start + length > SLOT_CAPACITY_BYTES) {
-        program.error('start/length must stay inside the 64 KB half', { exitCode: EXIT.ARG_ERROR });
+      const chunk = Number(opts.chunk);
+      const timeoutMs = Number(opts.timeout);
+      try {
+        validateReadbackRange(start, length, chunk, timeoutMs);
+      } catch (err) {
+        program.error(err instanceof Error ? err.message : String(err), { exitCode: EXIT.ARG_ERROR });
       }
       try {
-        const chunk = Number(opts.chunk);
-        if (!Number.isInteger(chunk) || chunk < 1 || chunk > 16) {
-          program.error('--chunk must be 1..16 (the Mirage answers nothing above 16 bytes)', { exitCode: EXIT.ARG_ERROR });
-        }
         const link = await MirageLink.open({ outPort: opts.port });
-        const image = new Uint8Array(length);
-        let covered = 0;
-        let badChecksums = 0;
-        let retries = 0;
+        let result: ReadbackResult;
         try {
-          // The Mirage answers one 0x0C frame per request and only for ranges
-          // of at most 16 bytes (verified on hardware), so read in small chunks.
-          for (let offset = 0; offset < length; offset += chunk) {
-            const n = Math.min(chunk, length - offset);
-            const request = buildWavesampleAbsoluteRequest({
-              half: half as 'upper' | 'lower',
-              startAddress: start + offset,
-              endAddress: (start + offset + n) & 0xffff,
-            });
-            let d: ReturnType<typeof parseWavesampleAbsoluteData> | undefined;
-            for (let attempt = 0; attempt < 3 && !d; attempt++) {
-              const reply = link.awaitSysex({ predicate: isWavesampleAbsoluteData, timeoutMs: Number(opts.timeout) });
-              link.sendSysex(request);
-              try {
-                d = parseWavesampleAbsoluteData(await reply);
-              } catch {
-                retries++;
-              }
-            }
-            if (!d) {
-              console.error(`error: no reply for ${start + offset}..${start + offset + n} after 3 attempts`);
-              process.exit(EXIT.TRANSFER_FAIL);
-            }
-            if (!d.checksumOk) badChecksums++;
-            const got = Math.min(d.audio8.length, n);
-            image.set(d.audio8.subarray(0, got), offset);
-            covered += got;
-            if (opts.verbose && (offset / chunk) % 256 === 0) console.error(`[mirage-send] ${covered}/${length} bytes`);
-          }
+          // Every chunk must be answered by a frame naming its own half and
+          // addresses with an intact checksum; anything else is retried, and
+          // an incomplete transfer writes no file.
+          result = await readWavesampleRam(link, {
+            half: half as 'upper' | 'lower',
+            startAddress: start,
+            length,
+            chunkBytes: chunk,
+            timeoutMs,
+            onProgress: (covered, total) => {
+              const chunksDone = Math.ceil(covered / chunk);
+              if (opts.verbose && (chunksDone % 256 === 0 || covered === total)) console.error(`[mirage-send] ${covered}/${total} bytes`);
+            },
+          });
         } finally {
           link.close();
         }
-        await writeFile(outFile, image);
-        console.log(
-          `Read ${covered}/${length} bytes, ${badChecksums} checksum error(s), ${retries} retried request(s). Wrote ${outFile}.`
-        );
-        process.exit(badChecksums === 0 && covered >= length ? EXIT.OK : EXIT.TRANSFER_FAIL);
+        await writeFile(outFile, result.image);
+        console.log(`Read ${length} bytes in ${result.stats.requests} request(s), ${describeStats(result.stats)}. Wrote ${outFile}.`);
+        process.exit(EXIT.OK);
       } catch (err) {
+        if (err instanceof ReadbackError) {
+          console.error(`error: ${err.message}; ${describeStats(err.stats)}. Nothing written.`);
+          process.exit(EXIT.TRANSFER_FAIL);
+        }
         printErr(err);
         const msg = err instanceof Error ? err.message : String(err);
         process.exit(/port/i.test(msg) ? EXIT.PORT_NOT_FOUND : EXIT.TRANSFER_FAIL);
       }
     }
   );
+
+function describeStats(stats: ReadbackStats): string {
+  const r = stats.rejected;
+  return (
+    `${stats.retries} retried, ${r.timeout} timeout(s), ${r.checksum} checksum error(s), ` +
+    `${r.length} wrong-length; ${stats.ignored} frame(s) for other requests and ${stats.undecodable} undecodable frame(s) skipped`
+  );
+}
 
 // ---------------------------------------------------------------------------
 // `init` — set MIDI params required for bidirectional SysEx
